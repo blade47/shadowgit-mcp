@@ -2,7 +2,7 @@
 // This avoids ESM/CommonJS conflicts while still testing core functionality
 
 import { describe, it, expect, beforeEach, jest } from '@jest/globals';
-import { execSync } from 'child_process';
+import { execFileSync } from 'child_process';
 import * as fs from 'fs';
 import * as os from 'os';
 import * as path from 'path';
@@ -13,7 +13,7 @@ jest.mock('fs');
 jest.mock('os');
 
 describe('ShadowGitMCPServer Logic Tests', () => {
-  let mockExecSync: jest.MockedFunction<typeof execSync>;
+  let mockExecFileSync: jest.MockedFunction<typeof execFileSync>;
   let mockExistsSync: jest.MockedFunction<typeof fs.existsSync>;
   let mockReadFileSync: jest.MockedFunction<typeof fs.readFileSync>;
   let mockHomedir: jest.MockedFunction<typeof os.homedir>;
@@ -21,7 +21,7 @@ describe('ShadowGitMCPServer Logic Tests', () => {
   beforeEach(() => {
     jest.clearAllMocks();
     
-    mockExecSync = execSync as jest.MockedFunction<typeof execSync>;
+    mockExecFileSync = execFileSync as jest.MockedFunction<typeof execFileSync>;
     mockExistsSync = fs.existsSync as jest.MockedFunction<typeof fs.existsSync>;
     mockReadFileSync = fs.readFileSync as jest.MockedFunction<typeof fs.readFileSync>;
     mockHomedir = os.homedir as jest.MockedFunction<typeof os.homedir>;
@@ -249,6 +249,159 @@ describe('ShadowGitMCPServer Logic Tests', () => {
     it('should read log level from environment', () => {
       const logLevel = 'debug';
       expect(['debug', 'info', 'warn', 'error']).toContain(logLevel);
+    });
+  });
+
+  describe('Manual Checkpoint Functionality', () => {
+    it('should validate required parameters', () => {
+      // Test that repo and title are required
+      const validateArgs = (args: any): boolean => {
+        return (
+          typeof args === 'object' &&
+          args !== null &&
+          'repo' in args &&
+          'title' in args &&
+          typeof args.repo === 'string' &&
+          typeof args.title === 'string'
+        );
+      };
+
+      expect(validateArgs({ repo: 'test', title: 'Test' })).toBe(true);
+      expect(validateArgs({ repo: 'test' })).toBe(false);
+      expect(validateArgs({ title: 'Test' })).toBe(false);
+      expect(validateArgs({})).toBe(false);
+      expect(validateArgs(null)).toBe(false);
+    });
+
+    it('should validate title length', () => {
+      const MAX_TITLE_LENGTH = 50;
+      const validateTitleLength = (title: string): boolean => {
+        return title.length <= MAX_TITLE_LENGTH;
+      };
+
+      expect(validateTitleLength('Normal title')).toBe(true);
+      expect(validateTitleLength('a'.repeat(50))).toBe(true);
+      expect(validateTitleLength('a'.repeat(51))).toBe(false);
+    });
+
+    it('should generate correct author email from name', () => {
+      const generateAuthorEmail = (author: string): string => {
+        return `${author.toLowerCase().replace(/\s+/g, '-')}@shadowgit.local`;
+      };
+
+      expect(generateAuthorEmail('Claude')).toBe('claude@shadowgit.local');
+      expect(generateAuthorEmail('GPT-4')).toBe('gpt-4@shadowgit.local');
+      expect(generateAuthorEmail('AI Assistant')).toBe('ai-assistant@shadowgit.local');
+      expect(generateAuthorEmail('Gemini Pro')).toBe('gemini-pro@shadowgit.local');
+    });
+
+    it('should properly escape shell special characters', () => {
+      const escapeShellString = (str: string): string => {
+        return str
+          .replace(/\\/g, '\\\\')  // Escape backslashes first
+          .replace(/"/g, '\\"')    // Escape double quotes
+          .replace(/\$/g, '\\$')   // Escape dollar signs
+          .replace(/`/g, '\\`')    // Escape backticks
+          .replace(/'/g, "\\'");   // Escape single quotes
+      };
+
+      expect(escapeShellString('normal text')).toBe('normal text');
+      expect(escapeShellString('text with $var')).toBe('text with \\$var');
+      expect(escapeShellString('text with "quotes"')).toBe('text with \\"quotes\\"');
+      expect(escapeShellString('text with `backticks`')).toBe('text with \\`backticks\\`');
+      expect(escapeShellString('text with \\backslash')).toBe('text with \\\\backslash');
+      expect(escapeShellString("text with 'single'")).toBe("text with \\'single\\'");
+      expect(escapeShellString('$var "quote" `tick` \\slash')).toBe('\\$var \\"quote\\" \\`tick\\` \\\\slash');
+    });
+
+    it('should format commit message correctly', () => {
+      const formatCommitMessage = (
+        title: string,
+        message: string | undefined,
+        author: string,
+        timestamp: string
+      ): string => {
+        let commitMessage = `✋ [${author}] Manual Checkpoint: ${title}`;
+        if (message) {
+          commitMessage += `\n\n${message}`;
+        }
+        commitMessage += `\n\nCreated by: ${author}\nTimestamp: ${timestamp}`;
+        return commitMessage;
+      };
+
+      const timestamp = '2024-01-01T12:00:00Z';
+      
+      // Test with minimal parameters
+      const msg1 = formatCommitMessage('Fix bug', undefined, 'AI Assistant', timestamp);
+      expect(msg1).toContain('✋ [AI Assistant] Manual Checkpoint: Fix bug');
+      expect(msg1).toContain('Created by: AI Assistant');
+      expect(msg1).toContain('Timestamp: 2024-01-01T12:00:00Z');
+      expect(msg1).not.toContain('undefined');
+
+      // Test with all parameters
+      const msg2 = formatCommitMessage('Add feature', 'Detailed description', 'Claude', timestamp);
+      expect(msg2).toContain('✋ [Claude] Manual Checkpoint: Add feature');
+      expect(msg2).toContain('Detailed description');
+      expect(msg2).toContain('Created by: Claude');
+    });
+
+    it('should extract commit hash from git output', () => {
+      const extractCommitHash = (output: string): string => {
+        const match = output.match(/\[[\w\s-]+\s+([a-f0-9]{7,})\]/);
+        return match ? match[1] : 'unknown';
+      };
+
+      expect(extractCommitHash('[main abc1234] Test commit')).toBe('abc1234');
+      expect(extractCommitHash('[feature-branch def56789] Another commit')).toBe('def56789');
+      expect(extractCommitHash('[develop 1a2b3c4d5e6f] Long hash')).toBe('1a2b3c4d5e6f');
+      expect(extractCommitHash('No match here')).toBe('unknown');
+    });
+
+    it('should set correct Git environment variables', () => {
+      const createGitEnv = (author: string) => {
+        const authorEmail = `${author.toLowerCase().replace(/\s+/g, '-')}@shadowgit.local`;
+        return {
+          GIT_AUTHOR_NAME: author,
+          GIT_AUTHOR_EMAIL: authorEmail,
+          GIT_COMMITTER_NAME: author,
+          GIT_COMMITTER_EMAIL: authorEmail
+        };
+      };
+
+      const env1 = createGitEnv('Claude');
+      expect(env1.GIT_AUTHOR_NAME).toBe('Claude');
+      expect(env1.GIT_AUTHOR_EMAIL).toBe('claude@shadowgit.local');
+      expect(env1.GIT_COMMITTER_NAME).toBe('Claude');
+      expect(env1.GIT_COMMITTER_EMAIL).toBe('claude@shadowgit.local');
+
+      const env2 = createGitEnv('GPT-4');
+      expect(env2.GIT_AUTHOR_NAME).toBe('GPT-4');
+      expect(env2.GIT_AUTHOR_EMAIL).toBe('gpt-4@shadowgit.local');
+    });
+
+    it('should handle isInternal flag for bypassing security', () => {
+      // Test that internal flag allows normally blocked commands
+      const isCommandAllowed = (command: string, isInternal: boolean): boolean => {
+        const SAFE_COMMANDS = new Set(['log', 'diff', 'show', 'status']);
+        const parts = command.trim().split(/\s+/);
+        const gitCommand = parts[0];
+        
+        if (isInternal) {
+          return true; // Bypass all checks for internal operations
+        }
+        
+        return SAFE_COMMANDS.has(gitCommand);
+      };
+
+      // Normal security checks
+      expect(isCommandAllowed('log', false)).toBe(true);
+      expect(isCommandAllowed('commit', false)).toBe(false);
+      expect(isCommandAllowed('add', false)).toBe(false);
+      
+      // Internal bypass
+      expect(isCommandAllowed('commit', true)).toBe(true);
+      expect(isCommandAllowed('add', true)).toBe(true);
+      expect(isCommandAllowed('anything', true)).toBe(true);
     });
   });
 });

@@ -37,3 +37,5 @@ Thumbs.db
 .env.development.local
 .env.test.local
 .env.production.local
+.shadowgit.git
+.claude

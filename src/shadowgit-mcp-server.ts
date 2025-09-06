@@ -1,4 +1,7 @@
-#!/usr/bin/env node
+/**
+ * ShadowGit MCP Server - Main Entry Point
+ * Provides read-only Git access, session management and checkpoint creation for AI assistants
+ */
 
 import { Server } from '@modelcontextprotocol/sdk/server/index.js';
 import { StdioServerTransport } from '@modelcontextprotocol/sdk/server/stdio.js';
@@ -6,512 +9,250 @@ import {
   CallToolRequestSchema, 
   ListToolsRequestSchema 
 } from '@modelcontextprotocol/sdk/types.js';
-import { execSync } from 'child_process';
-import * as path from 'path';
-import * as fs from 'fs';
-import * as os from 'os';
 
-// ============================================================================
-// Constants
-// ============================================================================
+import { log } from './utils/logger';
+import { VERSION } from './utils/constants';
+import { RepositoryManager } from './core/repository-manager';
+import { GitExecutor } from './core/git-executor';
+import { SessionClient } from './core/session-client';
+import { GitHandler } from './handlers/git-handler';
+import { ListReposHandler } from './handlers/list-repos-handler';
+import { CheckpointHandler } from './handlers/checkpoint-handler';
+import { SessionHandler } from './handlers/session-handler';
 
-const SHADOWGIT_DIR = '.shadowgit.git';
-const TIMEOUT_MS = parseInt(process.env.SHADOWGIT_TIMEOUT || '10000', 10); // Default 10 seconds
-const MAX_BUFFER_SIZE = 10 * 1024 * 1024; // 10MB
-const MAX_COMMAND_LENGTH = 1000; // Maximum git command length
-const VERSION = '1.0.0';
-
-// ============================================================================
-// Type Definitions
-// ============================================================================
-
-interface Repository {
-  name: string;
-  path: string;
-}
-
-interface GitCommandArgs {
-  repo: string;
-  command: string;
-}
-
-// The actual response format expected by MCP
-type MCPToolResponse = {
-  content: Array<{
-    type: string;
-    text: string;
-  }>;
-};
-
-// ============================================================================
-// Logging
-// ============================================================================
-
-type LogLevel = 'debug' | 'info' | 'warn' | 'error';
-
-const LOG_LEVELS: Record<LogLevel, number> = {
-  debug: 0,
-  info: 1,
-  warn: 2,
-  error: 3
-};
-
-const CURRENT_LOG_LEVEL = LOG_LEVELS[process.env.LOG_LEVEL as LogLevel] ?? LOG_LEVELS.info;
-
-const log = (level: LogLevel, message: string): void => {
-  if (LOG_LEVELS[level] >= CURRENT_LOG_LEVEL) {
-    const timestamp = new Date().toISOString();
-    process.stderr.write(`[${timestamp}] [shadowgit-mcp] [${level.toUpperCase()}] ${message}\n`);
-  }
-};
-
-// ============================================================================
-// Utility Functions
-// ============================================================================
-
-function getStorageLocation(): string {
-  const platform = process.platform;
-  const homeDir = os.homedir();
-  
-  switch (platform) {
-    case 'darwin':
-      return path.join(homeDir, '.shadowgit');
-    case 'win32':
-      return path.join(
-        process.env.LOCALAPPDATA || path.join(homeDir, 'AppData', 'Local'),
-        'shadowgit'
-      );
-    default:
-      return path.join(
-        process.env.XDG_DATA_HOME || path.join(homeDir, '.local', 'share'),
-        'shadowgit'
-      );
-  }
-}
-
-function fileExists(filePath: string): boolean {
-  try {
-    return fs.existsSync(filePath);
-  } catch {
-    return false;
-  }
-}
-
-function readJsonFile<T>(filePath: string, defaultValue: T): T {
-  try {
-    if (!fs.existsSync(filePath)) {
-      return defaultValue;
-    }
-    const content = fs.readFileSync(filePath, 'utf-8');
-    return JSON.parse(content) as T;
-  } catch (error) {
-    log('error', `Error reading JSON file ${filePath}: ${error}`);
-    return defaultValue;
-  }
-}
-
-function getShadowgitPath(repoPath: string): string {
-  return path.join(repoPath, SHADOWGIT_DIR);
-}
-
-function getGitEnvironment(repoPath: string): NodeJS.ProcessEnv {
-  return {
-    ...process.env,
-    GIT_DIR: getShadowgitPath(repoPath),
-    GIT_WORK_TREE: repoPath,
-  };
-}
-
-// ============================================================================
-// MCP Server Class
-// ============================================================================
-
-class ShadowGitMCPServer {
+export class ShadowGitMCPServer {
   private server: Server;
-  private repos: Map<string, string> = new Map(); // name -> path mapping
-  private isShuttingDown = false;
-  
-  // Whitelist of safe read-only git commands
-  private readonly SAFE_COMMANDS = new Set([
-    'log', 'diff', 'show', 'blame', 'grep', 'status',
-    'rev-parse', 'rev-list', 'ls-files', 'cat-file',
-    'diff-tree', 'shortlog', 'reflog', 'describe',
-    'branch', 'tag', 'for-each-ref', 'ls-tree',
-    'merge-base', 'cherry', 'count-objects'
-  ]);
-  
-  // Dangerous arguments to block
-  private readonly BLOCKED_ARGS = [
-    '--exec', '--upload-pack', '--receive-pack',
-    '-c', '--config', '--work-tree', '--git-dir',
-    'push', 'pull', 'fetch', 'commit', 'merge',
-    'rebase', 'reset', 'clean', 'checkout', 'add',
-    'rm', 'mv', 'restore', 'stash', 'remote',
-    'submodule', 'worktree', 'filter-branch',
-    'repack', 'gc', 'prune', 'fsck'
-  ];
-  
-  // Path traversal patterns to block
-  private readonly PATH_TRAVERSAL_PATTERNS = [
-    '../',
-    '..\\',
-    '%2e%2e',
-    '..%2f',
-    '..%5c'
-  ];
+  private repositoryManager: RepositoryManager;
+  private gitExecutor: GitExecutor;
+  private sessionClient: SessionClient;
+  private gitHandler: GitHandler;
+  private listReposHandler: ListReposHandler;
+  private checkpointHandler: CheckpointHandler;
+  private sessionHandler: SessionHandler;
 
   constructor() {
+    // Initialize core services
+    this.repositoryManager = new RepositoryManager();
+    this.gitExecutor = new GitExecutor();
+    this.sessionClient = new SessionClient();
+    
+    // Initialize handlers
+    this.gitHandler = new GitHandler(this.repositoryManager, this.gitExecutor);
+    this.listReposHandler = new ListReposHandler(this.repositoryManager);
+    this.checkpointHandler = new CheckpointHandler(
+      this.repositoryManager, 
+      this.gitExecutor
+    );
+    this.sessionHandler = new SessionHandler(
+      this.repositoryManager,
+      this.sessionClient
+    );
+    
+    // Initialize MCP server
     this.server = new Server(
       {
-        name: 'shadowgit-mcp',
-        version: VERSION
+        name: 'shadowgit-mcp-server',
+        version: VERSION,
       },
       {
         capabilities: {
-          tools: {}
-        }
+          tools: {},
+        },
       }
     );
     
-    this.loadRepositories();
     this.setupHandlers();
   }
 
-  private loadRepositories(): void {
-    const reposPath = path.join(getStorageLocation(), 'repos.json');
-    const repos: Repository[] = readJsonFile(reposPath, []);
-    
-    // Create name -> path mapping (avoid duplicate path entries)
-    repos.forEach((repo: Repository) => {
-      this.repos.set(repo.name, repo.path);
-    });
-    
-    log('info', `Loaded ${repos.length} repositories from ${reposPath}`);
-  }
-
-  private isGitCommandArgs(args: unknown): args is GitCommandArgs {
-    return (
-      typeof args === 'object' &&
-      args !== null &&
-      'repo' in args &&
-      'command' in args &&
-      typeof (args as GitCommandArgs).repo === 'string' &&
-      typeof (args as GitCommandArgs).command === 'string'
-    );
-  }
-
   private setupHandlers(): void {
-    // Register available tools
+    // List available tools
     this.server.setRequestHandler(ListToolsRequestSchema, async () => ({
       tools: [
         {
-          name: 'git',
-          description: `Execute read-only git commands on a specific ShadowGit repository.
-          
-IMPORTANT: You MUST specify which repository to query.
-Use list_repos() first to see available repositories.
-
-Example usage:
-- git({repo: "shadowgit-app", command: "log --oneline -5"})
-- git({repo: "/Users/alex/project", command: "diff HEAD~1 HEAD"})`,
-          
+          name: 'list_repos',
+          description: 'List all available ShadowGit repositories. Use this first to discover which repositories you can work with.',
+          inputSchema: {
+            type: 'object',
+            properties: {},
+          },
+        },
+        {
+          name: 'git_command',
+          description: 'Execute a read-only git command on a ShadowGit repository. Only safe, read-only commands are allowed.',
           inputSchema: {
             type: 'object',
             properties: {
               repo: {
                 type: 'string',
-                description: 'Repository name (from list_repos) or full path - REQUIRED'
+                description: 'Repository name (use list_repos to see available repositories)',
               },
               command: {
                 type: 'string',
-                description: 'Git command to execute (read-only commands only) - REQUIRED'
-              }
+                description: 'Git command to execute (e.g., "log -10", "diff HEAD~1", "status")',
+              },
             },
-            required: ['repo', 'command']  // Both parameters are required
-          }
+            required: ['repo', 'command'],
+          },
         },
         {
-          name: 'list_repos',
-          description: 'List all available ShadowGit repositories. Call this first to discover available repositories.',
+          name: 'start_session',
+          description: 'Start a work session. MUST be called BEFORE making any changes. Without this, ShadowGit will create fragmented auto-commits during your work!',
           inputSchema: {
             type: 'object',
-            properties: {}
-          }
+            properties: {
+              repo: {
+                type: 'string',
+                description: 'Repository name',
+              },
+              description: {
+                type: 'string',
+                description: 'What you plan to do in this session',
+              },
+            },
+            required: ['repo', 'description'],
+          },
+        },
+        {
+          name: 'checkpoint',
+          description: 'Create a git commit with your changes. Call this AFTER completing your work but BEFORE end_session. Creates a clean commit for the user to review.',
+          inputSchema: {
+            type: 'object',
+            properties: {
+              repo: {
+                type: 'string',
+                description: 'Repository name',
+              },
+              title: {
+                type: 'string',
+                description: 'Commit title (max 50 chars) - REQUIRED. Be specific about what was changed.',
+              },
+              message: {
+                type: 'string',
+                description: 'Detailed commit message (optional, max 1000 chars)',
+              },
+              author: {
+                type: 'string',
+                description: 'Author name (e.g., "Claude", "GPT-4"). Defaults to "AI Assistant"',
+              },
+            },
+            required: ['repo', 'title'],
+          },
+        },
+        {
+          name: 'end_session',
+          description: 'End your work session to resume ShadowGit auto-commits. MUST be called AFTER checkpoint to properly close your work session.',
+          inputSchema: {
+            type: 'object',
+            properties: {
+              sessionId: {
+                type: 'string',
+                description: 'Session ID from start_session',
+              },
+              commitHash: {
+                type: 'string',
+                description: 'Commit hash from checkpoint (optional)',
+              },
+            },
+            required: ['sessionId'],
+          },
         }
-      ]
+      ],
     }));
 
     // Handle tool execution
     this.server.setRequestHandler(CallToolRequestSchema, async (request) => {
       const { name, arguments: args } = request.params;
       
-      switch (name) {
-        case 'git':
-          return await this.handleGit(args);
-        case 'list_repos':
-          return await this.handleListRepos();
-        default:
-          return {
-            content: [
-              {
-                type: 'text',
-                text: `Unknown tool: ${name}`
-              }
-            ]
-          };
+      log('info', `Tool called: ${name}`);
+      
+      try {
+        switch (name) {
+          case 'list_repos':
+            return await this.listReposHandler.handle();
+            
+          case 'git_command':
+            return await this.gitHandler.handle(args);
+            
+          case 'start_session':
+            return await this.sessionHandler.startSession(args);
+            
+          case 'checkpoint':
+            return await this.checkpointHandler.handle(args);
+            
+          case 'end_session':
+            return await this.sessionHandler.endSession(args);
+            
+          default:
+            return {
+              content: [
+                {
+                  type: 'text',
+                  text: `Unknown tool: ${name}. Available tools: list_repos, git_command, start_session, checkpoint, end_session`,
+                },
+              ],
+            };
+        }
+      } catch (error) {
+        log('error', `Tool execution error: ${error}`);
+        return {
+          content: [
+            {
+              type: 'text',
+              text: `Error executing ${name}: ${error}`,
+            },
+          ],
+        };
       }
     });
-  }
-
-  private async handleGit(args: unknown): Promise<MCPToolResponse> {
-    // Type guard for arguments
-    if (!this.isGitCommandArgs(args)) {
-      return {
-        content: [
-          {
-            type: 'text',
-            text: `Error: Both 'repo' and 'command' parameters are required.
-
-Example usage:
-  git({repo: "my-project", command: "log --oneline -5"})
-
-Use list_repos() to see available repositories.`
-          }
-        ]
-      };
-    }
-    
-    // Now args is properly typed as GitCommandArgs
-    const repoPath = this.resolveRepoPath(args.repo);
-    
-    if (!repoPath) {
-      const availableRepos = Array.from(this.repos.keys())
-        .filter(key => !key.startsWith('/')) // Only show names, not full paths
-        .join(', ');
-      
-      return {
-        content: [
-          {
-            type: 'text',
-            text: `Error: Repository '${args.repo}' not found.
-
-Available repositories: ${availableRepos || '(none)'}
-
-Use list_repos() for full details, or provide the full path to the repository.`
-          }
-        ]
-      };
-    }
-    
-    // Use existing getShadowgitPath utility instead of hardcoding
-    const shadowGitDir = getShadowgitPath(repoPath);
-    if (!fileExists(shadowGitDir)) {
-      return {
-        content: [
-          {
-            type: 'text',
-            text: `Error: No ShadowGit repository found at ${repoPath}
-
-The directory exists but doesn't have a ${SHADOWGIT_DIR} folder.
-This repository may not be tracked by ShadowGit yet.`
-          }
-        ]
-      };
-    }
-    
-    // Execute git command
-    const result = await this.executeGit(args.command, repoPath);
-    
-    return {
-      content: [
-        {
-          type: 'text',
-          text: result
-        }
-      ]
-    };
-  }
-
-  private async handleListRepos(): Promise<MCPToolResponse> {
-    if (this.repos.size === 0) {
-      return {
-        content: [
-          {
-            type: 'text',
-            text: 'No repositories found. Add repositories through the ShadowGit application.'
-          }
-        ]
-      };
-    }
-    
-    // Format repository list (simple and clean)
-    const repoList = Array.from(this.repos.entries())
-      .map(([name, path]) => `• ${name}\n  Path: ${path}`);
-    
-    return {
-      content: [
-        {
-          type: 'text',
-          text: `Available ShadowGit repositories:\n\n${repoList.join('\n\n')}`
-        }
-      ]
-    };
-  }
-
-  private resolveRepoPath(repoNameOrPath: string): string | null {
-    // Validate input for path traversal attempts
-    for (const pattern of this.PATH_TRAVERSAL_PATTERNS) {
-      if (repoNameOrPath.toLowerCase().includes(pattern)) {
-        log('warn', `Blocked path traversal attempt: ${repoNameOrPath}`);
-        return null;
-      }
-    }
-    
-    // First check if it's a known repo name or path
-    const mappedPath = this.repos.get(repoNameOrPath);
-    if (mappedPath) return mappedPath;
-    
-    // Check if it's a valid path that exists
-    // Support Unix-style paths and Windows paths
-    const isPath = repoNameOrPath.startsWith('/') || 
-                   repoNameOrPath.startsWith('~') ||
-                   repoNameOrPath.includes(':') || // Windows drive letter
-                   repoNameOrPath.startsWith('\\\\'); // UNC path
-                   
-    if (isPath) {
-      const resolvedPath = path.normalize(repoNameOrPath.replace('~', os.homedir()));
-      
-      // Ensure the resolved path is absolute and doesn't escape
-      if (!path.isAbsolute(resolvedPath)) {
-        log('warn', `Invalid path provided: ${repoNameOrPath}`);
-        return null;
-      }
-      
-      if (fileExists(resolvedPath)) {
-        return resolvedPath;
-      }
-    }
-    
-    return null;
-  }
-
-  private async executeGit(command: string, repoPath: string): Promise<string> {
-    // Check command length
-    if (command.length > MAX_COMMAND_LENGTH) {
-      return `Error: Command too long (max ${MAX_COMMAND_LENGTH} characters).`;
-    }
-    
-    // Remove any null bytes or control characters
-    const sanitizedCommand = command.replace(/[\x00-\x08\x0B\x0C\x0E-\x1F\x7F]/g, '');
-    
-    // Safety check 1: Extract and validate command
-    const parts = sanitizedCommand.trim().split(/\s+/);
-    const gitCommand = parts[0];
-    
-    if (!this.SAFE_COMMANDS.has(gitCommand)) {
-      return `Error: Command '${gitCommand}' is not allowed. Only read-only commands are permitted.
-
-Allowed commands: ${Array.from(this.SAFE_COMMANDS).join(', ')}`;
-    }
-    
-    // Safety check 2: Block dangerous arguments
-    for (const blocked of this.BLOCKED_ARGS) {
-      if (command.includes(blocked)) {
-        return `Error: Argument '${blocked}' is not allowed for safety reasons.`;
-      }
-    }
-    
-    // Log command execution (sanitized for security)
-    log('debug', `Executing git command in ${repoPath}: ${gitCommand} [args hidden]`);
-    
-    // Execute git command with proper environment
-    const startTime = Date.now();
-    try {
-      const output = execSync(`git ${sanitizedCommand}`, {
-        cwd: repoPath,
-        env: getGitEnvironment(repoPath),
-        encoding: 'utf8',
-        timeout: TIMEOUT_MS,
-        maxBuffer: MAX_BUFFER_SIZE
-      });
-      
-      const executionTime = Date.now() - startTime;
-      log('debug', `Command completed in ${executionTime}ms`);
-      return output || '(empty output)';
-      
-    } catch (error: any) {
-      const executionTime = Date.now() - startTime;
-      log('error', `Command failed after ${executionTime}ms: ${error.message}`);
-      
-      // Handle specific error cases
-      if (error.code === 'ENOENT') {
-        return 'Error: Git is not installed or not in PATH. Please install git and try again.';
-      }
-      if (error.signal === 'SIGTERM') {
-        return `Error: Command timed out (${TIMEOUT_MS / 1000} second limit). Try a simpler query.`;
-      }
-      if (error.code === 'ENOBUFS' || error.message?.includes('maxBuffer')) {
-        return 'Error: Output too large. Try limiting the results (e.g., use -n flag or --max-count).';
-      }
-      if (error.status === 128) {
-        const stderr = error.stderr?.toString() || error.message;
-        // Sanitize error messages that might contain sensitive paths
-        const sanitizedError = stderr.replace(/\/[^\s]*/g, '[path]');
-        return `Git error: ${sanitizedError}`;
-      }
-      
-      // Generic error
-      return `Error executing git command: ${error.message?.substring(0, 200)}`;
-    }
   }
 
   async start(): Promise<void> {
-    // Setup graceful shutdown handlers
-    process.on('SIGINT', () => this.shutdown('SIGINT'));
-    process.on('SIGTERM', () => this.shutdown('SIGTERM'));
-    process.on('uncaughtException', (error) => {
-      log('error', `Uncaught exception: ${error}`);
-      this.shutdown('uncaughtException');
-    });
-    process.on('unhandledRejection', (reason) => {
-      log('error', `Unhandled rejection: ${reason}`);
-      this.shutdown('unhandledRejection');
-    });
+    log('info', `Starting ShadowGit MCP Server v${VERSION}`);
+    
+    // Check Session API health
+    const isSessionApiHealthy = await this.sessionClient.isHealthy();
+    if (isSessionApiHealthy) {
+      log('info', 'Session API is available - session tracking enabled');
+    } else {
+      log('warn', 'Session API is not available - proceeding without session tracking');
+    }
     
     const transport = new StdioServerTransport();
     await this.server.connect(transport);
-    log('info', `Server started with ${this.repos.size} repositories`);
-    log('info', `Version: ${VERSION}, Timeout: ${TIMEOUT_MS}ms, Log Level: ${process.env.LOG_LEVEL || 'info'}`);
+    
+    log('info', 'ShadowGit MCP Server is running');
+  }
+
+  shutdown(signal: string): void {
+    log('info', `Received ${signal}, shutting down gracefully...`);
+    process.exit(0);
+  }
+}
+
+// Main entry point
+async function main(): Promise<void> {
+  // Handle CLI arguments
+  if (process.argv.includes('--version')) {
+    console.log(VERSION);
+    process.exit(0);
   }
   
-  private shutdown(signal: string): void {
-    if (this.isShuttingDown) return;
-    this.isShuttingDown = true;
+  try {
+    const server = new ShadowGitMCPServer();
     
-    log('info', `Received ${signal}, shutting down gracefully...`);
+    // Handle shutdown signals
+    process.on('SIGINT', () => server.shutdown('SIGINT'));
+    process.on('SIGTERM', () => server.shutdown('SIGTERM'));
     
-    // Give ongoing requests time to complete
-    setTimeout(() => {
-      process.exit(0);
-    }, 1000);
+    await server.start();
+  } catch (error) {
+    log('error', `Failed to start server: ${error}`);
+    process.exit(1);
   }
 }
 
-// ============================================================================
-// Entry Point
-// ============================================================================
-
-async function main(): Promise<void> {
-  const server = new ShadowGitMCPServer();
-  await server.start();
-}
-
-// Run if this is the main module
-if (require.main === module) {
-  main().catch((error) => {
-    log('error', `Failed to start server: ${error}`);
-    process.exit(1);
-  });
-}
-
-export { ShadowGitMCPServer };
+// Start the server
+main().catch((error) => {
+  log('error', `Unhandled error: ${error}`);
+  process.exit(1);
+});
