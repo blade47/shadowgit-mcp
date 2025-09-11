@@ -343,4 +343,7 @@ MIT License - see [LICENSE](LICENSE) file for details.
 
 ---
 
+
 Transform your development history into a powerful AI debugging assistant! 🚀
+
+[![MCP Badge](https://lobehub.com/badge/mcp/shadowgit-shadowgit-mcp-server)](https://lobehub.com/mcp/shadowgit-shadowgit-mcp-server)
